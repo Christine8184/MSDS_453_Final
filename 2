@@ -1,0 +1,221 @@
+import os
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import LatentDirichletAllocation, PCA
+from sklearn.cluster import KMeans
+from sklearn.manifold import TSNE
+from transformers import AutoTokenizer, AutoModel
+import torch
+import shutil
+
+# --- 1. Setup and Data Loading ---
+folder_path = "/Users/evehuang/Downloads/453_doc"
+
+def load_texts_from_folder(folder_path):
+    documents = []
+    filenames = []
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".txt"):
+            filepath = os.path.join(folder_path, filename)
+            with open(filepath, "r", encoding="utf-8") as f:
+                documents.append(f.read())
+                filenames.append(filename)
+    # Sort to ensure consistent order
+    sorted_pairs = sorted(zip(filenames, documents))
+    sorted_filenames, sorted_documents = zip(*sorted_pairs)
+    return list(sorted_documents), list(sorted_filenames)
+
+documents, filenames = load_texts_from_folder(folder_path)
+print(f"\nLoaded {len(documents)} documents from '{folder_path}'.")
+print("Document Order:", filenames) # To help match documents to topics
+
+# --- NEW FUNCTION FOR TOKENIZATION SUMMARY ---
+def summarize_tokens(documents, token_pattern=r'\b\w+\b', sample_docs=2, max_tokens_per_doc=20):
+    """
+    Summarizes the words being tokenized based on a given pattern.
+
+    Args:
+        documents (list): A list of strings, where each string is a document.
+        token_pattern (str): The regex pattern used for tokenization.
+        sample_docs (int): Number of sample documents to display tokenization for.
+        max_tokens_per_doc (int): Maximum number of tokens to show per sample document.
+    """
+    print("\n--- Tokenization Summary (Before Vectorization) ---")
+    print(f"Using token_pattern: '{token_pattern}'")
+    print(f"Showing up to {max_tokens_per_doc} tokens for {sample_docs} sample documents.")
+
+    for i, doc in enumerate(documents[:sample_docs]):
+        # Convert to lowercase first, as TfidfVectorizer does this
+        doc_lower = doc.lower()
+        # Find all tokens matching the pattern
+        tokens = re.findall(token_pattern, doc_lower)
+        print(f"\nDocument {i+1} (first {max_tokens_per_doc} tokens):")
+        print(tokens[:max_tokens_per_doc])
+    print("--------------------------------------------------")
+
+# Call the new function right after loading documents and before TF-IDF Vectorizer
+summarize_tokens(documents, token_pattern=r'\b\w+\b', sample_docs=3, max_tokens_per_doc=15)
+
+
+# 1. TF-IDF Vectorization (avoiding stopwords, lemmatization, stemming)
+tfidf_vectorizer = TfidfVectorizer(
+    lowercase=True,
+    token_pattern=r'\b\w+\b',
+    stop_words=None, # To keep stopwords, as per previous discussion's implied goal
+    ngram_range=(1, 1)
+)
+
+tfidf_matrix = tfidf_vectorizer.fit_transform(documents)
+feature_names = tfidf_vectorizer.get_feature_names_out()
+
+print(f"\nTF-IDF matrix shape: {tfidf_matrix.shape}")
+
+# --- 2. Topic Modeling ---
+
+## Latent Dirichlet Allocation (LDA)
+n_components_lda = 2 # Changed to 2 topics
+lda_model = LatentDirichletAllocation(
+    n_components=n_components_lda,
+    random_state=42,
+    learning_method='batch',
+    n_jobs=-1
+)
+lda_topic_distributions = lda_model.fit_transform(tfidf_matrix)
+lda_dominant_topics = np.argmax(lda_topic_distributions, axis=1)
+
+print("\n--- LDA Topics (Top Words) ---")
+def display_topics(model, feature_names, no_top_words):
+    topics_list = []
+    for topic_idx, topic in enumerate(model.components_):
+        top_words = [feature_names[i] for i in topic.argsort()[:-no_top_words - 1:-1]]
+        topics_list.append(top_words)
+        print(f"Topic {topic_idx + 1}: {' '.join(top_words)}")
+    return topics_list
+
+lda_top_words = display_topics(lda_model, feature_names, 10)
+print(f"LDA Dominant Topics for documents: {lda_dominant_topics}")
+
+## KMeans Clustering on TF-IDF Vectors
+n_clusters_tfidf = 2 # Changed to 2 clusters/topics
+kmeans_tfidf = KMeans(n_clusters=n_clusters_tfidf, random_state=42, n_init=10)
+kmeans_tfidf_labels = kmeans_tfidf.fit_predict(tfidf_matrix)
+
+print(f"\nKMeans (TF-IDF) Clusters/Topics: {kmeans_tfidf_labels}")
+
+## BERT for Topic Modeling (Generating Embeddings)
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+model = AutoModel.from_pretrained("bert-base-uncased")
+
+def get_bert_embeddings(texts, tokenizer, model, device="cpu"):
+    model.to(device)
+    model.eval()
+    embeddings = []
+    batch_size = 8
+    for i in range(0, len(texts), batch_size):
+        batch_texts = texts[i:i+batch_size]
+        inputs = tokenizer(batch_texts, return_tensors="pt", truncation=True, padding=True, max_length=512)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs = model(**inputs)
+        batch_embeddings = outputs.last_hidden_state[:, 0, :].cpu().numpy()
+        embeddings.extend(batch_embeddings)
+    return np.array(embeddings)
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"\nUsing device for BERT embeddings: {device}")
+
+bert_embeddings = get_bert_embeddings(documents, tokenizer, model, device)
+print(f"BERT embeddings shape: {bert_embeddings.shape}")
+
+# KMeans Clustering on BERT Embeddings (changed to 2 clusters)
+n_clusters_bert = 2
+kmeans_bert = KMeans(n_clusters=n_clusters_bert, random_state=42, n_init=10)
+bert_kmeans_labels = kmeans_bert.fit_predict(bert_embeddings)
+
+print(f"BERT (KMeans) Clusters/Topics: {bert_kmeans_labels}")
+
+# KNN-based Clustering for Topic Modeling (on BERT Embeddings - changed to 2 clusters)
+n_clusters_knn = 2
+kmeans_knn_bert = KMeans(n_clusters=n_clusters_knn, random_state=42, n_init=10)
+knn_bert_labels = kmeans_knn_bert.fit_predict(bert_embeddings)
+
+print(f"\nKNN-based (KMeans on BERT) Clusters/Topics: {knn_bert_labels}")
+
+# --- 3. Visualize Topic Results ---
+
+# Prepare data for visualization
+results_df = pd.DataFrame({
+    'filename': filenames,
+    'document': documents,
+    'lda_topic': lda_dominant_topics,
+    'kmeans_tfidf_topic': kmeans_tfidf_labels,
+    'bert_kmeans_topic': bert_kmeans_labels,
+    'knn_bert_topic': knn_bert_labels
+})
+
+print("\n--- Document Topics Summary ---")
+print(results_df)
+
+# Dimensionality Reduction for Visualization
+# PCA for TF-IDF
+pca_tfidf = PCA(n_components=2, random_state=42)
+tfidf_2d = pca_tfidf.fit_transform(tfidf_matrix.toarray())
+
+# PCA for LDA (n_components_lda is already 2, so this is just using the existing components)
+lda_2d = lda_topic_distributions
+
+# t-SNE for BERT embeddings
+tsne_bert = TSNE(n_components=2, random_state=42, perplexity=min(5, len(documents) - 1))
+bert_2d = tsne_bert.fit_transform(bert_embeddings)
+
+# Plotting function (remains the same)
+def plot_topics(data_2d, labels, title, method_name, ax, custom_palette=None):
+    if custom_palette is None:
+        custom_palette = sns.color_palette("viridis", n_colors=len(np.unique(labels)))
+
+    plot_df = pd.DataFrame(data_2d, columns=['Component 1', 'Component 2'])
+    plot_df['Topic'] = labels
+    plot_df['Filename'] = [f.replace(".txt", "") for f in filenames]
+
+    sns.scatterplot(
+        x='Component 1',
+        y='Component 2',
+        hue='Topic',
+        data=plot_df,
+        palette=custom_palette,
+        s=150,
+        alpha=0.8,
+        edgecolor='k',
+        legend='full',
+        ax=ax
+    )
+    ax.set_title(f'{title}\n({method_name})', fontsize=14)
+    ax.set_xlabel('Component 1')
+    ax.set_ylabel('Component 2')
+    ax.grid(True, linestyle='--', alpha=0.6)
+
+    for i, txt in enumerate(plot_df['Filename']):
+        ax.text(data_2d[i, 0] + 0.05, data_2d[i, 1] + 0.05, txt,
+                fontdict={'size': 8, 'weight': 'bold'}, alpha=0.7)
+
+
+# --- Create and show plots ---
+fig, axes = plt.subplots(2, 2, figsize=(20, 15))
+axes = axes.flatten()
+
+fig.suptitle('Topic Modeling Comparison Across Methods (2 Topics)', fontsize=20, y=1.02)
+
+n_total_topics = 2
+color_palette = sns.color_palette("tab10", n_total_topics)
+
+plot_topics(lda_2d, results_df['lda_topic'], 'LDA Topics', 'LDA', axes[0], custom_palette=color_palette)
+plot_topics(tfidf_2d, results_df['kmeans_tfidf_topic'], 'KMeans Topics', 'TF-IDF + KMeans', axes[1], custom_palette=color_palette)
+plot_topics(bert_2d, results_df['bert_kmeans_topic'], 'KMeans Topics', 'BERT Embeddings + KMeans', axes[2], custom_palette=color_palette)
+plot_topics(bert_2d, results_df['knn_bert_topic'], 'KNN-based Topics', 'BERT Embeddings + KNN Clustering', axes[3], custom_palette=color_palette)
+
+plt.tight_layout(rect=[0, 0.03, 1, 0.98])
+plt.show()
